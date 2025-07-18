@@ -1,0 +1,512 @@
+---
+title: "GAM_webnovels"
+author: ""
+date: "2025-07-01"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+Some data cleaning to preaprare the data in a long format.
+
+```{r setup, message=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+
+combined_df <- read_csv("/Users/fedor/Nextcloud/projects/GOLEM/RUG/staff/PhD/Ze/transfer_3196827_files_1f89898a/merged_sentiment_data.csv")
+
+webnovel_df <- read_csv("/Users/fedor/Nextcloud/projects/GOLEM/RUG/staff/PhD/Ze/transfer_3196827_files_1f89898a/webnovel_para_com_sentiment_GAM_with_paragraph_index.csv")
+
+qidian_df <- read_csv("/Users/fedor/Nextcloud/projects/GOLEM/RUG/staff/PhD/Ze/transfer_3196827_files_1f89898a/qidian_para_com_sentiment_GAM.csv")
+
+combined_df <- combined_df |>
+  arrange(bookId, chapterIndex, paragraphIndex)
+
+combined_df_clean <- combined_df |>
+  select(bookId, source, chapterIndex, paragraphIndex,
+         CN_reviewId, CN_CN_paragraph_sentiment, CN_CN_comment_sentiment,
+         EN_reviewId, EN_EN_paragraph_sentiment, EN_EN_comment_sentiment) |>
+  group_by(bookId) |>
+  filter(all(c("qidian", "webnovel") %in% source)) |>
+  ungroup()
+```
+
+```{r message=FALSE}
+long_df <- combined_df_clean |>
+  pivot_longer(c(CN_CN_paragraph_sentiment, EN_EN_paragraph_sentiment),
+               names_to = "source_sentiment",
+               values_to = "paragraph_sentiment") |>
+  pivot_longer(c(CN_CN_comment_sentiment, EN_EN_comment_sentiment),
+               names_to = "source_sentiment2",
+               values_to = "comment_sentiment") |>
+  select(bookId, source, chapterIndex, paragraphIndex, 
+         CN_reviewId, EN_reviewId,
+         paragraph_sentiment, comment_sentiment) |>
+  drop_na(paragraph_sentiment, comment_sentiment) |>
+  group_by(bookId, source, chapterIndex, paragraphIndex) |>
+  summarize(paragraph_sentiment = mean(paragraph_sentiment),
+            avg_comment_sentiment = mean(comment_sentiment)) |>
+  ungroup() |>
+  group_by(bookId, source) |>
+  mutate(new_index = row_number()) |>
+  ungroup()
+  
+```
+
+```{r message=FALSE}
+df_equal <- long_df |>
+  group_by(bookId) |>
+  mutate(min_count = min(table(source))) |>
+  group_by(bookId, source) |>
+  filter(new_index <= min_count) |>
+  ungroup()
+```
+
+Let's smooth the sentiment using a moving window of 11 or 51 paragraphs.
+
+```{r message=FALSE}
+library(zoo) # for rolling mean
+
+df_equal_roll <- df_equal |>
+  group_by(bookId, source) |>
+  mutate(paragraph_sentiment_roll_10 = rollmean(paragraph_sentiment, 10, fill = NA),
+         paragraph_sentiment_roll_50 = rollmean(paragraph_sentiment, 50, fill = NA),
+         comment_sentiment_roll_10 = rollmean(avg_comment_sentiment, 10, fill = NA),
+         comment_sentiment_roll_50 = rollmean(avg_comment_sentiment, 50, fill = NA))
+```
+
+Let's plot one book, as a check.
+
+```{r}
+df_equal_roll |>
+  filter(bookId == "6831850602000905") |>
+  ggplot(aes(x = new_index, y = paragraph_sentiment_roll_50, 
+             group = source, color = source)) +
+  geom_line() +
+  #geom_smooth(method = "loess", se = FALSE) +
+  labs(
+    title = "Paragraph sentiment by platform",
+    x = "Paragraph index",
+    y = "Paragraph sentiment score",
+    color = "Platform"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+```{r}
+# 1. Pivot longer so both variables are in a single 'value' column
+df_long <- df_equal_roll |>
+  pivot_longer(
+    cols = c(paragraph_sentiment_roll_50, comment_sentiment_roll_50),
+    names_to = "sentiment_source",
+    values_to = "sentiment_value"
+  ) |>
+  mutate(
+    source = as.factor(source),
+    # Combine source and variable for grouping
+    source_var = paste(source, sentiment_source, sep = "_")
+  )
+
+# 2. Define colors: same base color for each source, but with different shades
+source_levels <- unique(df_long$source)
+color_palette <- c(
+  "qidian_paragraph_sentiment_roll_50" = "#1f77b4",
+  "qidian_comment_sentiment_roll_50"       = "#aec7e8",
+  "webnovel_paragraph_sentiment_roll_50" = "#ff7f0e",
+  "webnovel_comment_sentiment_roll_50"       = "#ffbb78"
+  # Add more if you have more sources
+)
+
+# 3. Plot
+df_long |>
+    filter(bookId == "6831850602000905") |>
+ggplot(aes(x = new_index, y = sentiment_value, color = source_var)) +
+  geom_line() +
+  scale_color_manual(values = color_palette,
+                     labels = c("Qidian paragraph", "Qidian comment", 
+                                "Webnovel paragraph", "Webnovel comment")) +
+  labs(
+    title = "Exampleof paragraph and comment sentiment by platform",
+    x = "Paragraph index",
+    y = "Sentiment score",
+    color = "Platform & Variable"
+  ) +
+  theme_minimal() + 
+  theme(
+    legend.position = "bottom",
+    legend.box = "horizontal"
+  ) +
+  guides(
+    color = guide_legend(nrow = 2),
+    fill = guide_legend(nrow = 2)
+  )
+
+ggsave("example_arcs.png", bg = "white", width = 8, height = 4)
+```
+
+Both stories and comments seem to have more positive sentiment on webnovel.
+
+Now let's move to the statistical modeling.
+
+```{r message=FALSE}
+library(mgcv) # for the GAM model
+library(itsadug) # for visualization the estimated effects from the GAM model
+library(plotfunctions)
+```
+
+Let's start with the simplest model. This is equivalent to a linear regression,
+becasue we're not adding any smooth.
+
+```{r}
+mod_GAM0 <- bam(comment_sentiment_roll_50 ~ paragraph_sentiment_roll_50,
+          data = df_equal_roll, method = "ML")
+
+summary(mod_GAM0)
+```
+
+`paragraph_sentiment` is strongly associated with `comment_sentiment`, explaining
+18.6% of its variance.
+
+Now let's try with a nonlinear fitting.
+
+```{r}
+mod_GAM <- gam(comment_sentiment_roll_50 ~ s(paragraph_sentiment_roll_50),
+          data = df_equal_roll, method = "ML")
+
+summary(mod_GAM)
+```
+
+The Rsq improved, so the nonlinear fitting is able to better explain the association
+between the two variables.
+
+Now let's test the hypothesis that the progression of `paragraph_sentiment` matters to
+predict `comment_sentiment`. We start by including a second nonlinear predictor.
+
+```{r}
+mod_GAM2 <- gam(comment_sentiment_roll_50 ~ s(paragraph_sentiment_roll_50) + s(new_index),
+          data = df_equal_roll, method = "ML")
+
+summary(mod_GAM2)
+```
+
+The model has a higher Rsq, so this tells us that the progression of the story (`new_index`)
+goes in parallel with significantly different values of `comment_sentiment`, but we don't know 
+if this variation is actaully related to the variation of `paragraph_sentiment`.
+Now let's test the interaction between `paragraph_sentiment` and the progression
+of the story. Since we know that there might be a shift in sentiment arcs due to the rolling
+averaging, better to smooth the nonlinear fitting usign `te()` rather than `s()`
+to stay more flexible ad have different smoothness in each direction (anisotropic smooths).
+Note that `te()` tests for both the main effect of the two predictors and their interaction,
+so there is no need to also include them as fixed effects outside the smooth.
+
+```{r}
+mod_GAM3 <- gam(comment_sentiment_roll_50 ~ te(paragraph_sentiment_roll_50, new_index),
+                data = df_equal_roll, method = "ML")
+
+summary(mod_GAM3)
+```
+
+So far we haven't taken into account the fact that the data are coming from two different platforms,
+with two different userbases. We need to include `source` in the model to be more accurate.
+Since we want to allow different intercepts by `source`, we need to include it as a fixed effect
+as well.
+
+```{r}
+df_equal_roll$source <- as.factor(df_equal_roll$source)
+
+mod_GAM3_source <- gam(comment_sentiment_roll_50 ~ source 
+                       + te(paragraph_sentiment_roll_50, new_index, by = source),
+                data = df_equal_roll, method = "ML")
+
+summary(mod_GAM3_source)
+```
+
+The Rsq went from 0.20 to 0.39, so not including `source` was partly hiding the association between 
+`pargraph_sentiment` and `comment_sentiment` because there is a lot of variability in the data
+across the two platforms.
+Let's quantify the difference in model fit.
+
+```{r}
+compareML(mod_GAM3, mod_GAM3_source) 
+```
+
+`mod_GAM3_source` has a much bigger score (the negative sign can be ignored).
+
+Let's remove the main effects to double check whether the interaction is significant 
+(`ti()` does it).
+
+```{r}
+mod_GAM3_source_nomain <- gam(comment_sentiment_roll_50 ~ source 
+                       + ti(paragraph_sentiment_roll_50, new_index, by = source),
+                data = df_equal_roll, method = "ML")
+
+summary(mod_GAM3_source_nomain)
+```
+
+```{r}
+qqnorm(resid(mod_GAM3_source))
+qqline(resid(mod_GAM3_source))
+```
+
+Let's see if we can fit a better model by adding a random intercept for each book, 
+since the `comment_sentiment` for each book can be very different, depending on the plot.
+
+
+```{r}
+mod_GAM3_source_re <- gam(comment_sentiment_roll_50 ~ source 
+                       + te(paragraph_sentiment_roll_50, new_index, by = source)
+                       + s(bookId, bs = "re"),
+                data = df_equal_roll, method = "ML")
+
+summary(mod_GAM3_source_re)
+```
+
+```{r}
+compareML(mod_GAM3_source, mod_GAM3_source_re) 
+```
+
+Allowing for baseline differences in `comment_sentiment` across books doesn't improve
+the explanatory power of the statistical model. Similarities of association between 
+`paragraph_sentiment` and `comment_sentiment` within platform are stronger than individual
+differences between books.
+
+A line plot is the most intuitive way to show the effect of `paragraph_sentiment` on `comment_sentiment` over
+the progression of the book, but the best way to visualize that it's by comparing the different effect of positive,
+neutral, and negative sentences. So, let's create a new variable to code `paragraph_sentiment` 
+into three bins, even though this is a simplification.
+We're creating a new dataset (`pred_grid`) with variables like `new_index`, `source`, and `paragraph_sentiment_roll_51`, which match the model’s predictors. This allows us to generate predicted values for combinations of these variables not necessarily in the original training data. This is useful for visualization and model interpretation.
+
+```{r}
+df_equal_roll <- df_equal_roll |>
+  mutate(sentiment_group = cut(paragraph_sentiment_roll_50,
+                                breaks = quantile(paragraph_sentiment_roll_50, 
+                                                  probs = c(0, 1/3, 2/3, 1), na.rm = TRUE),
+                                labels = c("Low", "Medium", "High"),
+                                include.lowest = TRUE))
+
+# Representative sentiment values per bin
+sentiment_vals <- df_equal_roll |>
+  group_by(sentiment_group) |>
+  summarise(paragraph_sentiment_roll_50 = median(paragraph_sentiment_roll_50, na.rm = TRUE), .groups = "drop")
+
+# Create prediction grid
+pred_grid <- expand.grid(
+  new_index = seq(min(df_equal_roll$new_index), max(df_equal_roll$new_index), length.out = 2000),
+  source = unique(df_equal_roll$source),
+  sentiment_group = c("Low", "Medium", "High")) |>
+  left_join(sentiment_vals, by = "sentiment_group")
+
+preds <- predict(mod_GAM3_source, newdata = pred_grid, type = "response", se.fit = TRUE)
+pred_grid$fit <- preds$fit
+pred_grid$se <- preds$se.fit
+
+# 95% Confidence Interval
+pred_grid <- pred_grid |>
+  mutate(
+    lower = fit - 1.96 * se,
+    upper = fit + 1.96 * se
+  )
+
+pred_grid |>
+  ggplot(aes(x = new_index, y = fit, color = sentiment_group, fill = sentiment_group)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.2, color = NA) +
+  geom_line(linewidth = 1) +
+  facet_wrap(~ source) +
+  labs(
+    title = "GAM predictions with 95% confidence intervals",
+    x = "Paragraph index",
+    y = "Predicted comment sentiment",
+    color = "Sentiment range",
+    fill = "Sentiment range"
+  ) +
+  scale_color_manual(values = c("Low" = "#1E88E5",
+                              "Medium" = "#FDB863",
+                              "High" = "#D73027")) +
+  scale_fill_manual(values = c("Low" = "#1E88E5",
+                              "Medium" = "#FDB863",
+                              "High" = "#D73027")) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    legend.box = "horizontal"
+  )
+
+```
+
+```{r}
+png(filename = "model_source.png", width = 8, height = 6, units="in", res=300)
+
+
+plot.new()
+plot_smooth(mod_GAM3_source, view="new_index",
+            cond = list(source), n.grid = 2000,
+            # main = "Average association of each story paragraph's sentiment 
+            # with comment sentiment",
+            shade = TRUE, col = c("#1f77b4", "#ff7f0e"), rm.ranef = T,
+            xlab = "Paragraph index",
+            ylab = "Observed comment sentiment",
+            plot_all = "source", h0 = NULL,
+            legend_plot_all = "left") 
+
+dev.off()
+```
+
+
+Let's try to also plot the original values and compare them to the predicted values.
+We plot the median sentiment value for each paragraph, otherwise the plot is too noisy.
+
+```{r}
+df_equal_roll_categorical <- df_equal_roll |>
+  mutate(sentiment_group = cut(paragraph_sentiment_roll_50,
+                                breaks = quantile(paragraph_sentiment_roll_50, 
+                                                  probs = c(0, 1/3, 2/3, 1), na.rm = TRUE),
+                                labels = c("Low", "Medium", "High"),
+                                include.lowest = TRUE))
+
+# Compute median comment_sentiment_roll_51 per new_index, source, and sentiment group
+df_median <- df_equal_roll_categorical |>
+  group_by(new_index, source, sentiment_group) |>
+  summarise(comment_sentiment_roll_50_median = median(comment_sentiment_roll_50, na.rm = TRUE), .groups = "drop")
+
+
+# Plot observed values
+df_median |>
+  drop_na(comment_sentiment_roll_50_median) |>
+  ggplot(aes(x = new_index, y = comment_sentiment_roll_50_median, color = sentiment_group)) +
+    geom_line() +
+    facet_wrap(~ source) +
+    labs(
+      title = "Observed comment sentiment by paragraph index and sentiment level (3 bins)",
+      x = "Paragraph index",
+      y = "Observed comment sentiment",
+      color = "Sentiment range"
+    ) +
+    scale_color_manual(values = c("High" = "#D73027",
+                              "Medium" = "#FDB863",
+                              "Low" = "#1E88E5")) +
+    theme_minimal() + 
+  theme(legend.position = "bottom")
+```
+
+Obviously, the trend of the observed values for `comment_sentiment` (but remember they have 
+already been averaged using a rolling window) is more complex than the predicted values.
+The predicted values are those estimated by our best-fitting model, based on the variance
+of `paragraph_sentiment`.
+Still, what is shown by the predicted values is that, for Qidian the association between
+`paragraph_sentiment` and `comment_sentiment` is more straightforward: a more positive sentiment
+in the story leads to a more positive sentiment of the comments throughout the whole 
+observed part of the story (remember that we only have data for the first third of the story
+and fewer stories with more than 1500 paragraphs, hence the larger confidence intervals).
+The association is more complex for Webnovel, with a clear positive association only
+between the paragraphs 700 and 1200, and a negative association after paragraph 1500.
+This is why GAMs can be useful: they can account for an inversion of assocation 
+between varaibles, in interaction with a third variable.
+
+An alternative way to verify the soundness of this statistical model is to convert
+`paragraph_sentiment` into a categorical predictor (with 3 categories).
+
+
+```{r}
+# df_equal_roll_categorical <- df_equal_roll |>
+#   mutate(paragraph_sentiment_cat = case_when(paragraph_sentiment < -0.1 ~ "Low",
+#                                              paragraph_sentiment > 0.1 ~ "High",
+#                                              .default = "Medium"),
+#          paragraph_sentiment_roll51_cat = case_when(paragraph_sentiment_roll_51 < -0.05 ~ "Low",
+#                                              paragraph_sentiment_roll_51 > 0.05 ~ "High",
+#                                              .default = "Medium"))
+
+df_equal_roll_categorical$sentiment_group <- as.factor(df_equal_roll_categorical$sentiment_group)
+
+df_equal_roll_categorical$source_ParagraphSentiment <- interaction(
+  df_equal_roll_categorical$source, 
+  df_equal_roll_categorical$sentiment_group)
+
+mod_GAM3_source_cat <- gam(comment_sentiment_roll_50 ~ source_ParagraphSentiment
+                           + s(new_index, by = source_ParagraphSentiment),
+                           data = df_equal_roll_categorical, method = "ML")
+
+summary(mod_GAM3_source_cat)
+
+```
+
+Even though we simplified the predictor, all interactions are still significant and
+the deviance explained is very similar.
+Now let's plot the `comment_sentiment` values predicted by this model.
+
+```{r results=FALSE}
+png(filename = "qidian.png", width = 8, height = 6, units="in", res=300)
+
+plot.new()
+plot_smooth(mod_GAM3_source_cat, view="new_index",
+            cond = list(source_ParagraphSentiment = 'qidian.High'), n.grid = 2000,
+            ylim = c(-0.2,-0.02), las=1,
+            main = "Qidian: Average association of each story paragraph's
+            sentiment with comment sentiment",
+            shade = TRUE, col = "#D73027", rm.ranef = T,
+            xlab = "Paragraph index",
+            ylab = "Observed comment sentiment",
+            h0 = NULL) 
+plot_smooth(mod_GAM3_source_cat, view="new_index",
+            cond = list(source_ParagraphSentiment = 'qidian.Low'), n.grid = 2000,
+            shade = TRUE, col = "#1E88E5", add = T, rm.ranef = T, h0 = NULL) 
+plot_smooth(mod_GAM3_source_cat, view="new_index",
+            cond = list(source_ParagraphSentiment = 'qidian.Medium'),  n.grid = 2000,
+            shade = TRUE, col = "#FDB863", add = T, rm.ranef = T, h0 = NULL) 
+
+legend("bottomleft", legend = c("Low paragraph sentiment", "Medium paragraph sentiment",
+                                "High paragraph sentiment"),
+       text.col = c("#1E88E5", "#FDB863", "#D73027"), bty = 'n', cex = 0.6)
+
+dev.off()
+
+```
+
+```{r results=FALSE}
+png(filename = "webnovel.png", width = 8, height = 6, units="in", res=300)
+
+plot.new()
+plot_smooth(mod_GAM3_source_cat, view="new_index",
+            cond = list(source_ParagraphSentiment = 'webnovel.High'), n.grid = 2000,
+            ylim = c(-0.12,0.1), las=1,
+            main = "Webnovel: Average association of each story paragraph's
+            sentiment with comment sentiment",
+            shade = TRUE, col = "#D73027", rm.ranef = T,
+            xlab = "Paragraph index",
+            ylab = "Observed comment sentiment",
+            h0 = NULL) 
+plot_smooth(mod_GAM3_source_cat, view="new_index",
+            cond = list(source_ParagraphSentiment = 'webnovel.Low'), n.grid = 2000,
+            shade = TRUE, col = "#1E88E5", add = T, rm.ranef = T, h0 = NULL) 
+plot_smooth(mod_GAM3_source_cat, view="new_index",
+            cond = list(source_ParagraphSentiment = 'webnovel.Medium'),  n.grid = 2000,
+            shade = TRUE, col = "#FDB863", add = T, rm.ranef = T, h0 = NULL) 
+
+legend("bottomleft", legend = c("Low paragraph sentiment", "Medium paragraph sentiment",
+                                "High paragraph sentiment"),
+       text.col = c("#1E88E5", "#FDB863", "#D73027"), bty = 'n', cex = 0.6)
+
+dev.off()
+```
+
+Tthe `comment_sentiment` valuse predicted by a 3-bins categorical `paragraph_sentiment` are still 
+a simplification of the observed data, but the trend seems more similar to the observed data
+than that of the values estimated by the continuous predictor (`mod_GAM3_source`).
+Let's verify ig this is indeed a better fitting model.
+
+```{r}
+compareML(mod_GAM3_source, mod_GAM3_source_cat) 
+```
+No, the model with the continuous predictor `mod_GAM3_source` has a better fit.
+
+To sum up, there is almost always a significant difference in the association between `comment_sentiment` and negative or positive `paragraph_sentiment` (the confidence 
+intervals do not overalp), but this difference is clearer on Qidian than on Webnovel.
+In one sentence: the sentiment of comments is more predictable on Qidian than on Webnovel.
+
+Future research should look into other factors that could explain the variation of teh association
+between these two variables. For examples, when are negative paragraphs predicting more positive
+comments? Are there genre-specific patterns in this association?
+
+
+
